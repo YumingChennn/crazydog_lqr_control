@@ -59,10 +59,6 @@ crazydog_lqr_control/
    ```bash
    python crazydog_lqr_balance.py config/crazydog.yaml
    ```
-5. **Optional** – Override the COM distance and auto-optimize the stance:
-   ```bash
-   python crazydog_lqr_balance.py config/crazydog.yaml --l_override 0.25
-   ```
 
 At startup the script:
 1. Loads `config/crazydog.yaml` for PD gains and initial joint targets.

@@ -13,6 +13,9 @@ import threading
 from keyboard_controller import KeyboardController
 
 NUM_MOTOR = 6
+
+_pinocchio_model = None
+_pinocchio_data = None
        
 # ======================================================
 # Quaternion → Pitch
@@ -28,21 +31,29 @@ def quat_to_pitch(qw, qx, qy, qz):
 def pd_control(target_q, q, kp, target_dq, dq, kd):
     return (target_q - q) * kp + (target_dq - dq) * kd
 
+def init_pinocchio_model():
+    """只在啟動時調用一次"""
+    global _pinocchio_model, _pinocchio_data
+    urdf_path = "/home/ray/crazydog_lqr_control/urdf/crazydog_urdf.urdf"
+    _pinocchio_model = pinocchio.buildModelFromUrdf(urdf_path, pinocchio.JointModelFreeFlyer())
+    
+    # 移除輪子質量
+    for link in ["L_wheel", "R_wheel"]:
+        fid = _pinocchio_model.getFrameId(link)
+        jid = _pinocchio_model.frames[fid].parentJoint
+        inertia = _pinocchio_model.inertias[jid]
+        _pinocchio_model.inertias[jid] = pinocchio.Inertia(0.0, inertia.lever, inertia.inertia)
+    
+    _pinocchio_data = _pinocchio_model.createData()
+
 # ======================================================
 # ----------  Pinocchio：自動計算質心 → 輪軸距離 l ----------
 # ======================================================
 def compute_COM_and_l(initial_angles):
-    urdf_path = "/home/ray/crazydog_mujoco/crazydog_urdf/urdf/crazydog_urdf.urdf"
+    """使用預載入的模型"""
+    global _pinocchio_model, _pinocchio_data
 
-    # 1. 用 free-flyer 建 pinocchio model
-    model = pinocchio.buildModelFromUrdf(
-        urdf_path,
-        pinocchio.JointModelFreeFlyer()
-    )
-    data = model.createData()
-
-    # 2. 初始化 q
-    nq = model.nq              # = 7 (base) + joints
+    nq = _pinocchio_model.nq
     q = np.zeros(nq)
     
     # base 固定在 0 0 0 + quaternion 1 0 0 0
@@ -51,27 +62,16 @@ def compute_COM_and_l(initial_angles):
     # joints = your initial_angles (6 motors)
     q[7:7+len(initial_angles)] = initial_angles
 
-    # ---------- 移除輪子質量 ----------
-    def zero_mass(link):
-        fid = model.getFrameId(link)
-        frame = model.frames[fid]
-        jid = frame.parentJoint
-        inertia = model.inertias[jid]
-        model.inertias[jid] = pinocchio.Inertia(0.0, inertia.lever, inertia.inertia)
-
-    zero_mass("L_wheel")
-    zero_mass("R_wheel")
-
     # ---------- Forward kinematics ----------
-    pinocchio.forwardKinematics(model, data, q)
-    pinocchio.updateFramePlacements(model, data)
+    pinocchio.forwardKinematics(_pinocchio_model, _pinocchio_data, q)
+    pinocchio.updateFramePlacements(_pinocchio_model, _pinocchio_data)
 
     # ---------- COM ----------
-    com = pinocchio.centerOfMass(model, data, q)
+    com = pinocchio.centerOfMass(_pinocchio_model, _pinocchio_data, q)
 
     # ---------- 取輪軸中點 ----------
-    pL = data.oMf[model.getFrameId("L_wheel")].translation
-    pR = data.oMf[model.getFrameId("R_wheel")].translation
+    pL = _pinocchio_data.oMf[_pinocchio_model.getFrameId("L_wheel")].translation
+    pR = _pinocchio_data.oMf[_pinocchio_model.getFrameId("R_wheel")].translation
     p_axle = 0.5 * (pL + pR)
 
     # ---------- 計算 COM 與輪軸距離 ----------
@@ -152,7 +152,7 @@ def find_angles_for_target_l(target_l, initial_guess=None):
 
             # 權重自己調：越大越「黏著」自然站姿
             w_sym   = 0.1
-            w_prior = 0.001
+            w_prior = 0.0001
 
             return loss_l + w_sym * symmetry_penalty + w_prior * prior_penalty
         except:
@@ -182,32 +182,19 @@ def find_angles_for_target_l(target_l, initial_guess=None):
 
 def compute_COM_and_l_silent(angles):
     """不輸出信息的版本，用於優化"""
-    urdf_path = "/home/ray/crazydog_mujoco/crazydog_urdf/urdf/crazydog_urdf.urdf"
-
-    model = pinocchio.buildModelFromUrdf(urdf_path, pinocchio.JointModelFreeFlyer())
-    data = model.createData()
-
-    nq = model.nq
+    global _pinocchio_model, _pinocchio_data
+    
+    nq = _pinocchio_model.nq
     q = np.zeros(nq)
     q[0:7] = np.array([0,0,0, 1,0,0,0])
     q[7:7+len(angles)] = angles
 
-    def zero_mass(link):
-        fid = model.getFrameId(link)
-        frame = model.frames[fid]
-        jid = frame.parentJoint
-        inertia = model.inertias[jid]
-        model.inertias[jid] = pinocchio.Inertia(0.0, inertia.lever, inertia.inertia)
+    pinocchio.forwardKinematics(_pinocchio_model, _pinocchio_data, q)
+    pinocchio.updateFramePlacements(_pinocchio_model, _pinocchio_data)
 
-    zero_mass("L_wheel")
-    zero_mass("R_wheel")
-
-    pinocchio.forwardKinematics(model, data, q)
-    pinocchio.updateFramePlacements(model, data)
-
-    com = pinocchio.centerOfMass(model, data, q)
-    pL = data.oMf[model.getFrameId("L_wheel")].translation
-    pR = data.oMf[model.getFrameId("R_wheel")].translation
+    com = pinocchio.centerOfMass(_pinocchio_model, _pinocchio_data, q)
+    pL = _pinocchio_data.oMf[_pinocchio_model.getFrameId("L_wheel")].translation
+    pR = _pinocchio_data.oMf[_pinocchio_model.getFrameId("R_wheel")].translation
     p_axle = 0.5 * (pL + pR)
 
     delta = com - p_axle
@@ -285,10 +272,10 @@ def build_LQR_6x6(l):
     P = solve_continuous_are(A6, B6, Q, R)
     K = np.linalg.inv(R) @ B6.T @ P   # (2×6)
 
-    print("===== LQR 6x6 Gain K (u_fwd,u_turn) =====")
-    print(K)
-    print(K.shape)
-    print("=========================================\n")
+    # print("===== LQR 6x6 Gain K (u_fwd,u_turn) =====")
+    # print(K)
+    # print(K.shape)
+    # print("=========================================\n")
 
     return K
 
@@ -316,7 +303,7 @@ def lqr_6x6_full_step(m, d, dt, kps, kds, target_dof_pos, K, v_ref=0.0, yaw_rate
         yaw_rate - yaw_rate_ref # yaw rate error
     ])
 
-    print(f"vx={vx:.3f} (ref={v_ref:.3f}), gz={gz:.3f} (ref={yaw_rate_ref:.3f})")
+    # print(f"vx={vx:.3f} (ref={v_ref:.3f}), gz={gz:.3f} (ref={yaw_rate_ref:.3f})")
 
     # control law
     u_vec = -K @ x_state
@@ -349,10 +336,8 @@ def lqr_6x6_full_step(m, d, dt, kps, kds, target_dof_pos, K, v_ref=0.0, yaw_rate
 # ======================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    kb = KeyboardController()
+    kb = KeyboardController(vx_scale=2.0, yaw_scale=3.0)
     parser.add_argument("config_file", type=str)
-    parser.add_argument("--l_override", type=float, default=None, 
-                        help="手動設定質心到輪軸的距離 l (m)，會自動優化關節角度")
     args = parser.parse_args()
 
     with open(args.config_file, "r") as f:
@@ -367,30 +352,24 @@ if __name__ == "__main__":
 
     target_dof_pos = initial_angles.copy()
 
+    init_pinocchio_model()
+
     # === Pinocchio 計算質心距離 l ===
     l_calculated = compute_COM_and_l(initial_angles)
-    
-    # === 可選：手動覆蓋 l 值並自動調整關節角度 ===
-    if args.l_override is not None:
-        l = args.l_override
-        optimized_angles = find_angles_for_target_l(l, initial_angles)
-        target_dof_pos = optimized_angles
-    else:
-        l = l_calculated
 
     # === 建立 LQR 控制器 ===
-    K = build_LQR_6x6(l)
+    K = build_LQR_6x6(l_calculated)
 
-    # === 建立高度查找表（啟動時預計算，之後使用極快） ===
-    l_lookup_values, angle_lookup_table = build_l_lookup_table(0.15, 0.35, num_samples=30)
+    l_min = max(0.15, l_calculated - 0.10)
+    l_max = min(0.35, l_calculated + 0.10)
+    l_lookup_values, angle_lookup_table = build_l_lookup_table(l_min, l_max, num_samples=30)
 
     delta_est = 0.0
+    l_previous = l_calculated  # 記錄上一次的 l 值
     
     print("\n===== 控制說明 =====")
-    print("UDP API 運行在端口 5005")
     print("使用遙控器程序控制機器人：")
-    print("\n調整 l 參數範例：")
-    print("  python test.py config/crazydog.yaml --l_override 0.25")
+    print("  python test.py config/crazydog.yaml")
     print("==================\n")
 
     # === MuJoCo 模型 ===
@@ -407,10 +386,13 @@ if __name__ == "__main__":
 
             v_ref, yaw_rate_ref, l_target = kb.get_command()
 
-            # if l_target is not None and 0.15 <= l_target <= 0.25:
-            #     l = l_target
-            #     target_dof_pos = interpolate_angles_from_l(l, l_lookup_values, angle_lookup_table)
-            #     K = build_LQR_6x6(l)
+            # 只有當 l_target 變化時才重新計算
+            if l_target is not None and 0.15 <= l_target <= 0.35:
+                if abs(l_target - l_previous) > 1e-6:  # 有變化才更新
+                    l = l_target
+                    target_dof_pos = interpolate_angles_from_l(l, l_lookup_values, angle_lookup_table)
+                    K = build_LQR_6x6(l)
+                    l_previous = l  # 更新記錄
             
             theta, theta_dot, u_vec, x_dot, delta_est = lqr_6x6_full_step(
                 m, d, m.opt.timestep,
@@ -431,34 +413,40 @@ if __name__ == "__main__":
             viewer.sync()
             time.sleep(max(0, m.opt.timestep - (time.time() - step_start)))
 
-    # ———— 繪圖 ————
+    # ———— 繪圖（美化版） ————
     import matplotlib.pyplot as plt
     t = np.arange(len(theta_list)) * m.opt.timestep
 
     plt.figure(figsize=(12, 8))
-    
+
+    # === Pitch Angle ===
     plt.subplot(3, 1, 1)
-    plt.plot(t, theta_list, 'b-', linewidth=1.5)
-    plt.ylabel("Theta (rad)")
-    plt.title("Pitch Angle")
-    plt.grid(True)
-    
+    plt.plot(t, theta_list, color='tab:blue', linewidth=2, alpha=1)
+    plt.ylabel("Theta (rad)", fontsize=11)
+    plt.title("Pitch Angle", fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.4)
+
+    # === Pitch Angular Velocity ===
     plt.subplot(3, 1, 2)
-    plt.plot(t, theta_dot_list, 'r-', linewidth=1.5)
-    plt.ylabel("Theta_dot (rad/s)")
-    plt.title("Pitch Angular Velocity")
-    plt.grid(True)
-    
+    plt.plot(t, theta_dot_list, color='tab:green', linewidth=2, alpha=1)
+    plt.ylabel("Theta dot (rad/s)", fontsize=11)
+    plt.title("Pitch Angular Velocity", fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.4)
+
+    # === Control Inputs ===
     plt.subplot(3, 1, 3)
-    plt.plot(t, u_fwd_list, 'g-', linewidth=1.5, label='u_fwd')
-    plt.plot(t, u_turn_list, 'm-', linewidth=1.5, label='u_turn')
-    plt.ylabel("Control Input")
-    plt.xlabel("Time (s)")
-    plt.title("Control Vector (u_fwd, u_turn)")
-    plt.legend()
-    plt.grid(True)
-    
+    plt.plot(t, u_fwd_list, color='tab:orange', linewidth=2, alpha=1, label='u_fwd')
+    plt.plot(t, u_turn_list, color='tab:purple', linewidth=2, alpha=1, label='u_turn')
+    plt.ylabel("Control Input", fontsize=11)
+    plt.xlabel("Time (s)", fontsize=11)
+    plt.title("Control Inputs", fontsize=12)
+    plt.legend(frameon=False)
+    plt.grid(True, linestyle='--', alpha=0.4)
+
+    # === 全域調整 ===
+    plt.suptitle("Pitch Dynamics and Control Signals", fontsize=14, y=0.98)
     plt.tight_layout()
     plt.show()
+
 
 
